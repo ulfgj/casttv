@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary & session files
+.tmp_*
+*.tmp
+TODO.md
+
+# Environment & local settings
+.env
+.venv/
+venv/
+ENV/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor & local tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI Assistant & Pair-Programming Tooling
+.agents/
+.gemini/
+.claude/
+*.claude
+.cursor/
+.cursorrules
+.copilot/
+.continue/
+*.agent.log
+.agents_cache/
+
+# Media files (avoid committing actual movie/audio/sub files by mistake)
+*.mp4
+*.mkv
+*.m4v
+*.webm
+*.avi
+*.srt
+*.vtt
+*.sub
