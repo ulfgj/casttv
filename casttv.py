@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 import argparse
 import re
-import select
+import signal
 import subprocess
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
+
+# Optional rumps import for macOS menu bar controls
+try:
+    import rumps
+    import rumps.rumps
+
+    _orig_app_support = rumps.rumps.application_support
+
+    def _safe_app_support(name: str) -> str:
+        try:
+            return _orig_app_support(name)
+        except Exception:
+            return f"/tmp/{name}"
+
+    rumps.rumps.application_support = _safe_app_support
+    HAS_RUMPS = True
+except ImportError:
+    HAS_RUMPS = False
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".m4v", ".webm", ".avi"}
 SUBTITLE_EXTENSIONS = (".srt", ".vtt")
@@ -35,27 +51,6 @@ CTL_COMMANDS: dict[str, tuple[str, list[str], bool]] = {
     "volumemute": ("volumemute", [], False),
     "status": ("status", [], False),
     "info": ("info", [], False),
-}
-
-# Single-key bindings active during live casting: key -> (catt args, label, show_output)
-KEY_BINDINGS: dict[str, tuple[list[str], str, bool]] = {
-    " ": (["play_toggle"], "Play / Pause", False),
-    "p": (["play_toggle"], "Play / Pause", False),
-    "f": (["ffwd", "30"], "Forward +30s", False),
-    "r": (["rewind", "30"], "Rewind -30s", False),
-    "+": (["volumeup"], "Volume +", False),
-    "=": (["volumeup"], "Volume +", False),
-    "-": (["volumedown"], "Volume -", False),
-    "m": (["volumemute"], "Mute toggle", False),
-    "i": (["status"], "Status", True),
-    "s": (["status"], "Status", True),
-}
-
-ARROW_KEY_BINDINGS: dict[str, tuple[list[str], str]] = {
-    "C": (["ffwd", "30"], "Forward +30s"),
-    "D": (["rewind", "30"], "Rewind -30s"),
-    "A": (["volumeup"], "Volume +"),
-    "B": (["volumedown"], "Volume -"),
 }
 
 
@@ -98,9 +93,10 @@ def parse_args() -> argparse.Namespace:
         help="Discover available Chromecast devices on the local network and exit.",
     )
     parser.add_argument(
-        "--no-controls",
+        "--no-gui",
+        "--headless",
         action="store_true",
-        help="Disable interactive keyboard playback controls while casting.",
+        help="Disable macOS menu bar controls while casting.",
     )
     parser.add_argument(
         "--ctl",
@@ -235,6 +231,19 @@ def resolve_subtitle_path(video_path: Path, explicit_sub: str | None) -> Path | 
     return None
 
 
+def get_device_mute_status(python_bin: str, target_device: str | None) -> bool | None:
+    """Query Chromecast status and return True if muted, False if unmuted, None if undetermined."""
+    try:
+        res = run_cast_control(python_bin, target_device, ["status"], capture=True)
+        text = (res.stdout or "") + (res.stderr or "")
+        match = re.search(r"Volume muted:\s*(True|False)", text, re.IGNORECASE)
+        if match:
+            return match.group(1).lower() == "true"
+    except Exception:
+        pass
+    return None
+
+
 def build_catt_control_args(ctl_tokens: list[str]) -> list[str]:
     """Translate user-facing --ctl verb and optional arguments into catt CLI arguments."""
     verb = ctl_tokens[0].lower()
@@ -244,12 +253,37 @@ def build_catt_control_args(ctl_tokens: list[str]) -> list[str]:
         supported = ", ".join(sorted(CTL_COMMANDS))
         raise ValueError(f"Unknown control command '{verb}'. Supported: {supported}")
 
+    if verb in ("mute", "volumemute"):
+        if not extra:
+            return ["volumemute", "toggle"]
+        val = extra[0].lower()
+        if val in ("1", "true", "t", "yes", "on"):
+            return ["volumemute", "true"]
+        if val in ("0", "false", "f", "no", "off"):
+            return ["volumemute", "false"]
+        if val == "toggle":
+            return ["volumemute", "toggle"]
+        raise ValueError(
+            f"Invalid mute option '{extra[0]}'. Use 'on', 'off', or omit to toggle."
+        )
+
     catt_cmd, defaults, requires_arg = CTL_COMMANDS[verb]
     if requires_arg and not extra:
         raise ValueError(f"Command '{verb}' requires an argument (e.g., --ctl {verb} 30).")
 
     args = extra if extra else defaults
     return [catt_cmd, *args]
+
+
+def resolve_control_args(
+    catt_args: list[str], python_bin: str, target_device: str | None
+) -> list[str]:
+    """Resolve dynamic control tokens (like 'toggle') into concrete arguments."""
+    if len(catt_args) >= 2 and catt_args[0] == "volumemute" and catt_args[1] == "toggle":
+        current_muted = get_device_mute_status(python_bin, target_device)
+        new_val = "false" if current_muted is True else "true"
+        return ["volumemute", new_val]
+    return catt_args
 
 
 def run_cast_control(
@@ -282,74 +316,106 @@ def send_chromecast_stop(python_bin: str, target_device: str | None) -> None:
         pass
 
 
-def _handle_keypress(
-    key: str,
-    python_bin: str,
-    target_device: str | None,
-) -> bool:
-    """Handle one keypress from the interactive remote. Return False to stop playback."""
-    if key in {"q", "Q", "\x03"}:
-        return False
+if HAS_RUMPS:
 
-    if key == "\x1b":
-        # Parse ANSI arrow escape sequences (\x1b[A / B / C / D)
-        if not select.select([sys.stdin], [], [], 0.05)[0]:
-            return True
-        if sys.stdin.read(1) != "[":
-            return True
-        if not select.select([sys.stdin], [], [], 0.05)[0]:
-            return True
-        arrow = sys.stdin.read(1)
-        if arrow in ARROW_KEY_BINDINGS:
-            catt_args, label = ARROW_KEY_BINDINGS[arrow]
-            print(f"\r🎛️  {label}   ")
-            run_cast_control(python_bin, target_device, catt_args, capture=True)
-        return True
+    class CastStatusBarApp(rumps.App):
+        """macOS menu bar application for Chromecast playback control."""
 
-    if key in KEY_BINDINGS:
-        catt_args, label, show_output = KEY_BINDINGS[key]
-        res = run_cast_control(python_bin, target_device, catt_args, capture=True)
-        if show_output:
-            output = res.stdout.strip() or res.stderr.strip() or "No status available."
-            print(f"\n📊 {output}\n")
-        else:
-            print(f"\r🎛️  {label}   ")
-    return True
+        def __init__(
+            self,
+            video_name: str,
+            device_name: str,
+            python_bin: str,
+            proc: subprocess.Popen[bytes] | subprocess.Popen[str],
+            target_device: str | None,
+        ) -> None:
+            super().__init__("CastTV", title="📺", quit_button=None)
+            self.video_name = video_name
+            self.device_name = device_name
+            self.python_bin = python_bin
+            self.proc = proc
+            self.target_device = target_device
+            self.muted = False
 
+            # Header items (read-only)
+            self.header_title = rumps.MenuItem(f"🎬 {self.video_name}")
+            self.header_device = rumps.MenuItem(f"📡 {self.device_name}")
 
-def interactive_control_loop(
-    proc: subprocess.Popen[bytes] | subprocess.Popen[str],
-    python_bin: str,
-    target_device: str | None,
-) -> None:
-    """Listen for single-key playback commands while the catt streaming server runs."""
-    print(
-        "🎛️  Controls: [Space/p] Play/Pause | [f/→] +30s | [r/←] -30s | "
-        "[+/-] Vol | [m] Mute | [i] Status | [q] Stop\n"
-    )
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        while proc.poll() is None:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
-            if not ready:
-                continue
-            key = sys.stdin.read(1)
-            if not _handle_keypress(key, python_bin, target_device):
-                print("\n🛑 Stopping Chromecast receiver...")
-                break
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            self.menu = [
+                self.header_title,
+                self.header_device,
+                None,
+                rumps.MenuItem("⏯  Play / Pause", callback=self.on_play_toggle),
+                rumps.MenuItem("⏩  Forward 10s", callback=self.on_forward_10),
+                rumps.MenuItem("⏩  Forward 30s", callback=self.on_forward_30),
+                rumps.MenuItem("⏪  Rewind 10s", callback=self.on_rewind_10),
+                rumps.MenuItem("⏪  Rewind 30s", callback=self.on_rewind_30),
+                None,
+                rumps.MenuItem("🔊  Volume Up (+5%)", callback=self.on_volume_up),
+                rumps.MenuItem("🔉  Volume Down (-5%)", callback=self.on_volume_down),
+                rumps.MenuItem("🔇  Toggle Mute", callback=self.on_toggle_mute),
+                None,
+                rumps.MenuItem("🛑  Stop Casting", callback=self.on_stop),
+            ]
+
+            self.muted = False
+
+            # Monitor background catt process; quit menu bar once playback ends
+            self.timer = rumps.Timer(self.on_tick, 1.5)
+            self.timer.start()
+
+        def on_tick(self, _sender: object) -> None:
+            if self.proc.poll() is not None:
+                self.timer.stop()
+                rumps.quit_application()
+
+        def on_play_toggle(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["play_toggle"], capture=True)
+
+        def on_forward_10(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["ffwd", "10"], capture=True)
+
+        def on_forward_30(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["ffwd", "30"], capture=True)
+
+        def on_rewind_10(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["rewind", "10"], capture=True)
+
+        def on_rewind_30(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["rewind", "30"], capture=True)
+
+        def on_volume_up(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["volumeup"], capture=True)
+
+        def on_volume_down(self, _sender: object) -> None:
+            run_cast_control(self.python_bin, self.target_device, ["volumedown"], capture=True)
+
+        def on_toggle_mute(self, _sender: object) -> None:
+            self.muted = not self.muted
+            arg = "true" if self.muted else "false"
+            run_cast_control(
+                self.python_bin, self.target_device, ["volumemute", arg], capture=True
+            )
+
+        def on_stop(self, _sender: object) -> None:
+            self.timer.stop()
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            send_chromecast_stop(self.python_bin, self.target_device)
+            rumps.quit_application()
 
 
 def cast_media(
     video_path: Path,
     sub_file: Path | None,
     device: str | None = None,
-    no_controls: bool = False,
+    no_gui: bool = False,
 ) -> None:
-    """Cast a video file and optional subtitles to a Google Chromecast using catt."""
+    """Cast a video file and optional subtitles to a Google Chromecast."""
     python_bin = sys.executable
     target_device = resolve_target_device(device)
 
@@ -368,10 +434,37 @@ def cast_media(
     print(f"🎬 Casting '{video_path.name}' to {target_desc}...")
 
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+    use_gui = HAS_RUMPS and not no_gui
+
+    def _sigint_handler(_sig: int, _frame: object) -> None:
+        print("\n🛑 Interrupt received! Stopping Chromecast receiver...")
+        if use_gui:
+            try:
+                rumps.quit_application()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        send_chromecast_stop(python_bin, target_device)
+        print("✅ Chromecast session stopped.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     try:
-        if sys.stdin.isatty() and not no_controls:
-            interactive_control_loop(proc, python_bin, target_device)
+        if use_gui:
+            print("🎛️  macOS menu bar controls active (click 📺 in your top menu bar).")
+            print("📺 Press Ctrl+C in terminal or click 'Stop Casting' in the menu bar to exit.\n")
+            dev_label = target_device or "Chromecast"
+            app = CastStatusBarApp(video_path.name, dev_label, python_bin, proc, target_device)
+            app.run()
         else:
+            if not HAS_RUMPS and not no_gui:
+                print("💡 Note: 'rumps' is not installed. Install with: pip3 install rumps")
             print("📺 Playback started! Press Ctrl+C to stop casting.\n")
             proc.wait()
     except KeyboardInterrupt:
@@ -410,7 +503,8 @@ def main() -> None:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
         target_device = resolve_target_device(args.device)
-        res = run_cast_control(sys.executable, target_device, catt_args, capture=False)
+        resolved_catt_args = resolve_control_args(catt_args, sys.executable, target_device)
+        res = run_cast_control(sys.executable, target_device, resolved_catt_args, capture=False)
         sys.exit(res.returncode)
 
     if not args.media:
@@ -419,7 +513,7 @@ def main() -> None:
 
     target_video = resolve_video_path(args.media)
     sub_file = resolve_subtitle_path(target_video, args.subtitles)
-    cast_media(target_video, sub_file, device=args.device, no_controls=args.no_controls)
+    cast_media(target_video, sub_file, device=args.device, no_gui=args.no_gui)
 
 
 if __name__ == "__main__":
