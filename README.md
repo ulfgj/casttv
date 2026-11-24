@@ -44,19 +44,35 @@ pip3 install -r requirements.txt
 ./casttv.py -d "my_chromecast" --ctl stop
 ```
 
-## macOS Menu Bar Controls
+## macOS Menu Bar Playback Controls
 
-While casting, a **📺** icon appears in your top macOS menu bar with instant playback controls:
+In `v0.4.0+`, interactive terminal keyboard controls were replaced by an unobtrusive native macOS Menu Bar application powered by [rumps](https://github.com/jaredks/rumps).
 
-* 🎬 **Now Playing**: Displays currently playing video title
-* 📡 **Device**: Displays target Chromecast device
-* ⏯ **Play / Pause**
-* ⏩ **Forward 10s** / ⏩ **Forward 30s**
-* ⏪ **Rewind 10s** / ⏪ **Rewind 30s**
-* 🔊 **Volume Up (+5%)** / 🔉 **Volume Down (-5%)** / 🔇 **Toggle Mute**
-* 🛑 **Stop Casting**: Disconnects Chromecast receiver cleanly and shuts down the session
+While casting, a **📺** icon appears in your top macOS menu bar with instant click controls:
 
-*(Use `--no-gui` to disable the menu bar app and run purely in headless CLI mode.)*
+| Control | Action |
+| :--- | :--- |
+| 🎬 **Now Playing** | Displays the title of the video file currently casting |
+| 📡 **Device** | Displays the active target Chromecast device |
+| ⏯ **Play / Pause** | Toggle playback on or off |
+| ⏩ **Forward 10s** | Skip forward 10 seconds |
+| ⏩ **Forward 30s** | Skip forward 30 seconds |
+| ⏪ **Rewind 10s** | Skip backward 10 seconds |
+| ⏪ **Rewind 30s** | Skip backward 30 seconds |
+| 🔊 **Volume Up (+5%)** | Increase Chromecast volume |
+| 🔉 **Volume Down (-5%)** | Decrease Chromecast volume |
+| 🔇 **Toggle Mute** | Mute or unmute Chromecast audio |
+| 🛑 **Stop Casting** | Cleanly terminates playback receiver and closes menu bar app |
+
+### Menu Bar Behavior & Headless Mode
+
+- **Automatic Lifecycle**: The menu bar item is created automatically when casting begins and automatically cleans up and exits when playback finishes or when stopped.
+- **No Terminal Hijacking**: The terminal is free from raw tty key capturing, meaning you can minimize or close the launching terminal without losing playback control.
+- **Headless Casting**: Use `--no-gui` (or `--headless`) to cast without launching the menu bar item (ideal for scripts, cron jobs, or SSH sessions):
+  ```bash
+  ./casttv.py -m /path/to/movie.mp4 --no-gui
+  ```
+- **Terminal Stop**: You can still stop casting at any time by pressing `Ctrl+C` in the terminal where `casttv` was started.
 
 > [!TIP]
 > **Stopping Orphan Sessions**: If a cast session was interrupted unexpectedly or the Chromecast is stuck buffering/playing, run `./casttv.py --ctl stop` (or `./casttv.py -d "device_name" --ctl stop`) from any terminal to immediately disconnect the receiver app and return the TV to its backdrop screen.
